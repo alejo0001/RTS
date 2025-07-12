@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import threading
 import time
 from typing import List
+import ssl
 
 try:
     import tkinter as tk
@@ -29,12 +30,23 @@ class DerivAPI:
         self.url = f"wss://ws.binaryws.com/websockets/v3?app_id={app_id}"
         self.ws = None
 
+    def safe_send(self, message: dict):
+        """Send a message and reconnect on failure."""
+        if self.ws is None:
+            self.connect()
+        try:
+            self.ws.send(json.dumps(message))
+        except (websocket.WebSocketConnectionClosedException, ssl.SSLError, ConnectionResetError):
+            print("WebSocket cerrado. Reconectando...")
+            self.connect()
+            self.ws.send(json.dumps(message))
+
     def connect(self):
         if websocket is None:
             raise RuntimeError("websocket-client is required")
         self.ws = websocket.WebSocket()
         self.ws.connect(self.url)
-        self.ws.send(json.dumps({"authorize": self.token}))
+        self.safe_send({"authorize": self.token})
         resp = json.loads(self.ws.recv())
         if resp.get("error"):
             raise RuntimeError(resp["error"]["message"])
@@ -54,7 +66,7 @@ class DerivAPI:
                 "symbol": symbol,
             },
         }
-        self.ws.send(json.dumps(req))
+        self.safe_send(req)
         return json.loads(self.ws.recv())
 
     def close(self):
