@@ -5,6 +5,7 @@ import threading
 import time
 from typing import List
 import ssl
+import os
 
 try:
     import tkinter as tk
@@ -300,14 +301,18 @@ class BotUI:
             raise RuntimeError("tkinter is required for the UI")
         self.root = tk.Tk()
         self.root.title("Deriv Bot")
+        self.accounts = {}
+        self.account_var = tk.StringVar()
         self._build()
+        self.load_accounts()
 
     def _build(self):
         frm = ttk.Frame(self.root, padding=10)
         frm.grid()
-        ttk.Label(frm, text="Token:").grid(column=0, row=0, sticky="w")
-        self.token_var = tk.StringVar()
-        ttk.Entry(frm, textvariable=self.token_var, width=40).grid(column=1, row=0)
+        ttk.Label(frm, text="Cuenta:").grid(column=0, row=0, sticky="w")
+        self.account_combo = ttk.Combobox(frm, textvariable=self.account_var, state="readonly", width=37)
+        self.account_combo.grid(column=1, row=0, sticky="w")
+        ttk.Button(frm, text="+", width=3, command=self.add_account_window).grid(column=2, row=0, sticky="w")
 
         ttk.Label(frm, text="Delay (s):").grid(column=0, row=1, sticky="w")
         self.delay_var = tk.IntVar(value=0)
@@ -371,13 +376,65 @@ class BotUI:
 
         self.bot = None
 
+    def load_accounts(self):
+        """Load saved accounts from keys.json."""
+        path = os.path.join(os.path.dirname(__file__), "keys.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.accounts = json.load(f)
+        except FileNotFoundError:
+            self.accounts = {}
+        except Exception:
+            self.accounts = {}
+        names = list(self.accounts.keys())
+        self.account_combo["values"] = names
+        if names:
+            self.account_var.set(names[0])
+
+    def save_accounts(self):
+        """Save accounts to keys.json."""
+        path = os.path.join(os.path.dirname(__file__), "keys.json")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self.accounts, f, indent=2)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save accounts: {e}")
+
+    def add_account_window(self):
+        """Open a window to add a new account."""
+        top = tk.Toplevel(self.root)
+        top.title("Agregar cuenta")
+
+        ttk.Label(top, text="Nombre:").grid(column=0, row=0, sticky="w")
+        name_var = tk.StringVar()
+        ttk.Entry(top, textvariable=name_var, width=30).grid(column=1, row=0)
+
+        ttk.Label(top, text="Token:").grid(column=0, row=1, sticky="w")
+        token_var = tk.StringVar()
+        ttk.Entry(top, textvariable=token_var, width=30).grid(column=1, row=1)
+
+        def save():
+            name = name_var.get().strip()
+            token = token_var.get().strip()
+            if not name or not token:
+                messagebox.showerror("Error", "Nombre y Token requeridos")
+                return
+            self.accounts[name] = token
+            self.save_accounts()
+            self.account_combo["values"] = list(self.accounts.keys())
+            self.account_var.set(name)
+            top.destroy()
+
+        ttk.Button(top, text="Guardar", command=save).grid(column=0, row=2, columnspan=2, pady=5)
+
+
     def start_bot(self):
-        token = self.token_var.get().strip()
+        token = self.accounts.get(self.account_var.get(), "").strip()
         if not token:
-            messagebox.showerror("Error", "Token required")
+            messagebox.showerror("Error", "Cuenta requerida")
             return
         if not self.row_signals:
-            messagebox.showerror("Error", "No signals loaded")
+            messagebox.showerror("Error", "No se han cargado señales")
             return
         self.bot = DerivBot(
             token=token,
