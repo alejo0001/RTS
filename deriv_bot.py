@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import threading
 import time
 from typing import List
+import ssl
 
 try:
     import tkinter as tk
@@ -29,15 +30,46 @@ class DerivAPI:
         self.url = f"wss://ws.binaryws.com/websockets/v3?app_id={app_id}"
         self.ws = None
 
+    def safe_send(self, message: dict):
+        """Send a message and reconnect on failure."""
+        if self.ws is None:
+            self.connect()
+        try:
+            self.ws.send(json.dumps(message))
+        except (websocket.WebSocketConnectionClosedException, ssl.SSLError, ConnectionResetError):
+            print("WebSocket cerrado. Reconectando...")
+            self.connect()
+            self.ws.send(json.dumps(message))
+
     def connect(self):
         if websocket is None:
             raise RuntimeError("websocket-client is required")
         self.ws = websocket.WebSocket()
         self.ws.connect(self.url)
-        self.ws.send(json.dumps({"authorize": self.token}))
+        self.safe_send({"authorize": self.token})
         resp = json.loads(self.ws.recv())
         if resp.get("error"):
             raise RuntimeError(resp["error"]["message"])
+        
+        
+    def recv(self):
+        """Receive a message from the WebSocket."""
+        if self.ws is None:
+            self.connect()
+        return json.loads(self.ws.recv())
+
+    def subscribe_contract(self, contract_id: int):
+        """Subscribe to updates for a specific contract."""
+        self.safe_send({
+            "proposal_open_contract": 1,
+            "contract_id": int(contract_id),
+            "subscribe": 1,
+        })
+
+    def forget_all(self, stream_type: str):
+        """Forget all subscriptions of a given type."""
+        self.safe_send({"forget_all": stream_type})
+
 
     def buy(self, symbol: str, direction: str, duration: int, amount: float):
         contract_type = "CALL" if direction.upper() == "CALL" else "PUT"
@@ -54,8 +86,13 @@ class DerivAPI:
                 "symbol": symbol,
             },
         }
-        self.ws.send(json.dumps(req))
-        return json.loads(self.ws.recv())
+        self.safe_send(req)
+        while True:
+            response = json.loads(self.ws.recv())
+            if response.get("msg_type") == "buy":
+                return response
+            else:
+                print(f"🔄 Ignorando mensaje no relacionado al 'buy': {response}")
 
     def close(self):
         if self.ws:
@@ -79,6 +116,25 @@ class DerivBot:
         self.running = False
         self.thread = None
 
+    def _wait_result(self, contract_id: int) -> float:
+        """Wait for a contract to be sold and return the profit."""
+        self.api.subscribe_contract(contract_id)
+        profit = 0.0
+        attempts = 0
+        while attempts < 300:  # máximo 300 intentos (~30s si 100ms entre cada uno)
+            msg = self.api.recv()
+            poc = msg.get("proposal_open_contract")
+            if poc and poc.get("contract_id") == contract_id:
+                if poc.get("is_sold"):
+                    profit = float(poc.get("profit", 0))
+                    self.api.forget_all("proposal_open_contract")
+                    break
+            time.sleep(0.1)
+            attempts += 1
+        else:
+            print(f"Timeout esperando resultado para contrato {contract_id}")
+        return profit
+
     def add_signal(self, signal: Signal):
         self.signals.append(signal)
         self.signals.sort(key=lambda s: s.time)
@@ -101,31 +157,69 @@ class DerivBot:
             for sig in list(self.signals):
                 if not self.running:
                     break
+
+                self.win_amount = 0.0
+                self.loss_amount = 0.0
+                self.current_stake = self.stake
+                profit = -1.0
+
                 now = datetime.now()
                 wait_time = (sig.time - timedelta(seconds=self.delay) - now).total_seconds()
                 if wait_time > 0:
                     time.sleep(wait_time)
-                amount = self.current_stake
-                if self.percent:
-                    # This is a placeholder for balance retrieval
-                    balance = 1000
-                    amount = balance * self.current_stake / 100
-                print(f"Executing {sig.symbol} {sig.direction} {sig.timeframe} at {datetime.now()} amount {amount}")
-                try:
-                    self.api.buy(sig.symbol, sig.direction, int(sig.timeframe[1:]), amount)
-                except Exception as e:
-                    print(f"Error placing trade: {e}")
-                # Here we would check result to update win/loss
-                # Placeholder win assumption
-                self.win_amount += amount
-                if self.stop_win and self.win_amount >= self.stop_win:
-                    print("Stop win reached")
-                    break
-                if self.stop_loss and self.loss_amount >= self.stop_loss:
-                    print("Stop loss reached")
-                    break
-                if self.martingale:
-                    self.current_stake *= 2
+                
+
+                print(f"📈 Inicio Martingala para {sig.symbol} {sig.direction} timeframe {sig.timeframe}")
+
+                while self.running and (profit <= 0):
+                    amount = self.current_stake
+                    if self.percent:
+                        balance = 1000  # placeholder for balance retrieval
+                        amount = balance * self.current_stake / 100
+                    print(
+                        f"Ejecutando  {sig.symbol} {sig.direction} {sig.timeframe} at {datetime.now()} amount {amount}"
+                    )
+                    try:
+                        result = self.api.buy(
+                            sig.symbol, sig.direction, int(sig.timeframe[1:]), amount
+                        )
+                    except Exception as e:
+                        print(f"Error al ejecutar trade: {e}")
+                        break
+                    contract_id = result.get("buy", {}).get("contract_id")
+                    if not contract_id:
+                        if not contract_id:
+                            print("No se recibió contract_id. Resultado:", result)
+                            break
+                    profit = self._wait_result(contract_id)
+                    if profit > 0:
+                        print(f"✅ Trade ganado. Ganancia: {profit}")
+                        self.win_amount += profit
+                        self.current_stake = self.stake
+
+                        if self.stop_win > 0 and self.win_amount >= self.stop_win:
+                            print(f"🎯 Stop win alcanzado ({self.win_amount} >= {self.stop_win})")
+                            self.running = False
+                        break
+                       
+                    else:
+                        print(f"🔁 Trade perdido. Perdida: {-profit}")
+                        self.loss_amount += -profit
+
+                        if self.stop_loss > 0 and self.loss_amount >= self.stop_loss:
+                            print(f"🛑 Stop loss alcanzado ({self.loss_amount} >= {self.stop_loss})")
+                            self.running = False
+                            break
+                        if not self.martingale:
+                            print("📌 Martingala desactivada. No se reintenta.")
+                            self.current_stake = self.stake
+                            break
+                        else:
+                            self.current_stake *= 2
+                            print(f"⚠️ Reintentando con Martingala. Nuevo stake: {self.current_stake}")
+            print(f"🏁 Fin Martingala para {sig.symbol}. Último profit: {profit}, stake final: {self.current_stake}")
+                # if self.martingale:
+                #     self.current_stake *= 2
         finally:
             self.api.close()
             self.running = False
