@@ -3,9 +3,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import threading
 import time
-from typing import List
+from typing import Dict, List
 import ssl
 import os
+import sys
 
 try:
     import tkinter as tk
@@ -195,7 +196,10 @@ class DerivBot:
         current_stake = self.stake
         profit = -1.0
 
-        print(f"📈 Inicio Martingala para {sig.symbol} {sig.direction} timeframe {sig.timeframe}")
+        if sig.martingale:
+            print(f"📈 Inicio Martingala para {sig.symbol} {sig.direction} timeframe {sig.timeframe}")
+        else:
+            print(f"📈 Ejecutando señal simple para {sig.symbol} {sig.direction} timeframe {sig.timeframe}")
 
         while self.running and profit <= 0:
             amount = current_stake
@@ -217,6 +221,9 @@ class DerivBot:
                 break
 
             profit = self._wait_result(contract_id)
+            if profit == 0:
+                print(f"⚠️ No se obtuvo ganancia. Verificar contrato o posible error.")
+
 
             if profit > 0:
                 print(f"✅ Trade ganado. Ganancia: {profit}")
@@ -233,6 +240,11 @@ class DerivBot:
                 break  # terminó con ganancia
 
             else:
+                if profit == 0:
+                    print(f"⚠️ Trade sin ganancia ni pérdida (break-even).")
+                else:
+                    print(f"🔁 Trade perdido. Pérdida: {-profit}")
+
                 print(f"🔁 Trade perdido. Perdida: {-profit}")
                 loss_amount += -profit
 
@@ -251,8 +263,11 @@ class DerivBot:
                 current_stake *= 2
                 print(f"⚠️ Reintentando con Martingala. Nuevo stake: {current_stake}")
 
-        print(f"🏁 Fin Martingala para {sig.symbol}. Último profit: {profit}, stake final: {current_stake}")
-
+        
+        if sig.martingale:
+            print(f"🏁 Fin Martingala para {sig.symbol}. Último profit: {profit}, stake final: {current_stake}")
+        else:
+            print(f"📈 fin operación simple para {sig.symbol} {sig.direction} timeframe {sig.timeframe}")
 
     def _run(self):
         self.api.connect()
@@ -303,102 +318,262 @@ class BotUI:
         self.root.title("Deriv Bot")
         self.accounts = {}
         self.account_var = tk.StringVar()
-        self._build()
+        self.console_visible = tk.BooleanVar(value=True)
+        self.row_signals: Dict[str, Signal] = {}
+        self.bot = None
+        #self._build()
+        self._build_ui()
         self.load_accounts()
+        self.redirect_output()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    def _build(self):
-        frm = ttk.Frame(self.root, padding=10)
-        frm.grid()
-        ttk.Label(frm, text="Cuenta:").grid(column=0, row=0, sticky="w")
-        self.account_combo = ttk.Combobox(frm, textvariable=self.account_var, state="readonly", width=37)
-        self.account_combo.grid(column=1, row=0, sticky="w")
-        ttk.Button(frm, text="+", width=3, command=self.add_account_window).grid(column=2, row=0, sticky="w")
+    def on_close(self):
+        if self.bot:
+            self.bot.stop()
+            self.bot = None
+        self.root.destroy()
 
-        ttk.Label(frm, text="Delay (s):").grid(column=0, row=1, sticky="w")
+    def redirect_output(self):
+        sys.stdout = ConsoleRedirector(self.console_output)
+        sys.stderr = ConsoleRedirector(self.console_output)
+
+    def toggle_console(self):
+        if self.console_visible.get():
+            self.console_frame.grid()
+        else:
+            self.console_frame.grid_remove()
+
+    def disable_all_inputs(self):
+        self.account_combo["state"] = "disabled"
+        self.stake_var_entry["state"] = "disabled"
+        self.delay_var_entry["state"] = "disabled"
+        self.percent_cb["state"] = "disabled"
+
+        self.stop_win_entry["state"] = "disabled"
+        self.stop_loss_entry["state"] = "disabled"
+        self.martingale_cb["state"] = "disabled"
+        self.apply_button["state"] = "disabled"
+
+        self.start_button["state"] = "disabled"
+        self.load_button["state"] = "disabled"
+        self.signals_text["state"] = "disabled"
+        self.tree["selectmode"] = "none"  # impedir clics
+
+        self.stop_button["state"] = "normal"
+
+
+    def enable_all_inputs(self):
+        self.account_combo["state"] = "readonly"
+        self.stake_var_entry["state"] = "normal"
+        self.delay_var_entry["state"] = "normal"
+        self.percent_cb["state"] = "normal"
+
+        self.stop_win_entry["state"] = "normal"
+        self.stop_loss_entry["state"] = "normal"
+        self.martingale_cb["state"] = "normal"
+        self.apply_button["state"] = "normal"
+
+        self.start_button["state"] = "normal"
+        self.load_button["state"] = "normal"
+        self.signals_text["state"] = "normal"
+        self.tree["selectmode"] = "browse"
+
+        self.stop_button["state"] = "disabled"
+
+    def set_ui_enabled(self, enabled: bool):
+        
+        state = "normal" if enabled else "disabled"
+        # Entradas
+        self.account_combo["state"] = "readonly" if enabled else "disabled"
+        self.stake_var_entry["state"] = state
+        self.delay_var_entry["state"] = state
+        self.percent_cb["state"] = state
+
+        # Parámetros globales
+        self.stop_win_entry["state"] = state
+        self.stop_loss_entry["state"] = state
+        self.martingale_cb["state"] = state
+        self.apply_button["state"] = state
+
+        # Señales
+        self.signals_text["state"] = state
+        self.tree["selectmode"] = "browse" if enabled else "none"
+
+        # Botones
+        self.start_button["state"] = state
+        self.load_button["state"] = state
+        self.stop_button["state"] = "normal" if not enabled else "disabled"
+
+    def stop_bot(self):
+        if self.bot:
+            self.bot.stop()
+            self.bot = None
+        self.set_ui_enabled(True)
+        self.enable_all_inputs()
+        self.stop_button["state"] = "disabled"
+        messagebox.showinfo("Bot", "Bot detenido")
+
+    def _build_ui(self):
+        self.root.geometry("980x650")
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        main = ttk.Frame(self.root, padding=10)
+        main.grid(sticky="nsew")
+        main.columnconfigure(1, weight=1)
+
+        # Left Frame - Configuración
+        left = ttk.LabelFrame(main, text="Configuración")
+        left.grid(row=0, column=0, sticky="nw", padx=5, pady=5)
+
+        ttk.Label(left, text="Cuenta:").grid(row=0, column=0, sticky="w")
+        self.account_combo = ttk.Combobox(left, textvariable=self.account_var, state="readonly", width=30)
+        self.account_combo.grid(row=0, column=1, sticky="w")
+        ttk.Button(left, text="+", width=3, command=self.add_account_window).grid(row=0, column=2, padx=5)
+
+        ttk.Label(left, text="Delay (s):").grid(row=1, column=0, sticky="w")
         self.delay_var = tk.IntVar(value=0)
-        ttk.Entry(frm, textvariable=self.delay_var, width=10).grid(column=1, row=1, sticky="w")
+        self.delay_var_entry = ttk.Entry(left, textvariable=self.delay_var, width=10)
+        self.delay_var_entry.grid(row=1, column=1, sticky="w")
 
-        ttk.Label(frm, text="Stake:").grid(column=0, row=2, sticky="w")
+        ttk.Label(left, text="Stake:").grid(row=2, column=0, sticky="w")
         self.stake_var = tk.DoubleVar(value=1.0)
-        ttk.Entry(frm, textvariable=self.stake_var, width=10).grid(column=1, row=2, sticky="w")
+        self.stake_var_entry = ttk.Entry(left, textvariable=self.stake_var, width=10)
+        self.stake_var_entry.grid(row=2, column=1, sticky="w")
 
         self.percent_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Stake %", variable=self.percent_var).grid(column=2, row=2, sticky="w")
+        self.percent_cb = ttk.Checkbutton(left, text="Stake %", variable=self.percent_var)
+        self.percent_cb.grid(row=2, column=2, sticky="w")
+
+        params = ttk.LabelFrame(left, text="Parámetros Globales")
+        params.grid(row=3, column=0, columnspan=3, sticky="ew", pady=5)
 
         self.martingale_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(frm, text="Martingale", variable=self.martingale_var).grid(column=1, row=3, sticky="w")
+        self.martingale_cb = ttk.Checkbutton(params, text="Martingale", variable=self.martingale_var)
+        self.martingale_cb.grid(row=0, column=0, sticky="w")
 
-        ttk.Label(frm, text="Stop Win:").grid(column=0, row=4, sticky="w")
+        ttk.Label(params, text="Stop Win:").grid(row=1, column=0, sticky="w")
         self.stop_win_var = tk.DoubleVar(value=0.0)
-        ttk.Entry(frm, textvariable=self.stop_win_var, width=10).grid(column=1, row=4, sticky="w")
+        self.stop_win_entry = ttk.Entry(params, textvariable=self.stop_win_var, width=10)
+        self.stop_win_entry.grid(row=1, column=1, sticky="w")
 
-        ttk.Label(frm, text="Stop Loss:").grid(column=0, row=5, sticky="w")
+        ttk.Label(params, text="Stop Loss:").grid(row=2, column=0, sticky="w")
         self.stop_loss_var = tk.DoubleVar(value=0.0)
-        ttk.Entry(frm, textvariable=self.stop_loss_var, width=10).grid(column=1, row=5, sticky="w")
+        self.stop_loss_entry = ttk.Entry(params, textvariable=self.stop_loss_var, width=10)
+        self.stop_loss_entry.grid(row=2, column=1, sticky="w")
 
-        ttk.Label(frm, text="Signals:").grid(column=0, row=6, sticky="nw")
-        self.signals_text = tk.Text(frm, width=60, height=5)
-        self.signals_text.grid(column=1, row=6, columnspan=2)
+        self.apply_button = ttk.Button(params, text="Aplicar", command=self.apply_globals)
+        self.apply_button.grid(row=3, column=0, columnspan=2, pady=5)
 
-        self.start_button = ttk.Button(frm, text="Start", command=self.start_bot)
-        self.start_button.grid(column=1, row=7, pady=5, sticky="e")
+        # Right Frame
+        right = ttk.Frame(main)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(3, weight=1)
 
-        self.load_button = ttk.Button(frm, text="Load", command=self.load_signals)
-        self.load_button.grid(column=2, row=7, pady=5, sticky="w")
+        ttk.Label(right, text="Señales:").grid(row=0, column=0, sticky="w")
+        self.signals_text = tk.Text(right, height=4)
+        self.signals_text.grid(row=1, column=0, sticky="ew")
 
-        cols = (
-            "use",
-            "fecha",
-            "hora",
-            "symbol",
-            "action",
-            "tf",
-            "sw",
-            "sl",
-            "mg",
+        btn_frame = ttk.Frame(right)
+        btn_frame.grid(row=2, column=0, sticky="ew", pady=5)
+
+        self.start_button = ttk.Button(btn_frame, text="Start", command=self.start_bot)
+        self.start_button.pack(side="left", padx=2)
+
+        self.stop_button = ttk.Button(btn_frame, text="Stop", command=self.stop_bot)
+        self.stop_button.pack(side="left", padx=2)
+        self.stop_button["state"] = "disabled"
+
+        self.load_button = ttk.Button(btn_frame, text="Load", command=self.load_signals)
+        self.load_button.pack(side="left", padx=2)
+
+        # Frame para Treeview con scrollbars
+        table_frame = ttk.Frame(right)
+        table_frame.grid(row=3, column=0, sticky="nsew", pady=5)
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
+
+        xscroll = ttk.Scrollbar(table_frame, orient="horizontal")
+        yscroll = ttk.Scrollbar(table_frame, orient="vertical")
+
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=("use", "fecha", "hora", "symbol", "action", "tf", "sw", "sl", "mg"),
+            show="headings",
+            xscrollcommand=xscroll.set,
+            yscrollcommand=yscroll.set,
+            height=6
         )
-        self.tree = ttk.Treeview(frm, columns=cols, show="headings", height=6)
-        self.tree.grid(column=0, row=8, columnspan=3, pady=5)
-        self.tree.heading("use", text="✔")
-        self.tree.heading("fecha", text="Fecha")
-        self.tree.heading("hora", text="Hora")
-        self.tree.heading("symbol", text="Símbolo")
-        self.tree.heading("action", text="Acción")
-        self.tree.heading("tf", text="Temp")
-        self.tree.heading("sw", text="Stop Win")
-        self.tree.heading("sl", text="Stop Loss")
-        self.tree.heading("mg", text="Martingale")
-        self.tree.column("use", width=40, anchor="center")
+        xscroll.config(command=self.tree.xview)
+        yscroll.config(command=self.tree.yview)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        xscroll.grid(row=1, column=0, sticky="ew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+
+        for col in ("use", "fecha", "hora", "symbol", "action", "tf", "sw", "sl", "mg"):
+            self.tree.heading(col, text=col.capitalize())
+            self.tree.column(col, anchor="center")
+
         self.tree.bind("<Button-1>", self.on_tree_click)
         self.tree.bind("<Double-1>", self.edit_signal)
 
-        self.row_signals = {}
+        ttk.Checkbutton(right, text="Mostrar consola", variable=self.console_visible, command=self.toggle_console).grid(row=4, column=0, sticky="w")
 
-        self.bot = None
+        self.console_frame = ttk.Frame(right)
+        self.console_frame.grid(row=5, column=0, sticky="nsew")
+
+        self.console_output = tk.Text(
+            self.console_frame, height=8, state="disabled",
+            bg="#1e1e1e", fg="#d4d4d4", insertbackground="white",
+            font=("Consolas", 9)
+        )
+        self.console_output.pack(fill="both", expand=True)
+
+
+
+    
+    def get_config_path(self, filename="keys.json"):
+        """Ruta persistente segura (escribible) para configuraciones."""
+        base_dir = os.path.expanduser("~")  # Carpeta del usuario (segura para escritura)
+        app_dir = os.path.join(base_dir, ".deriv_bot")  # Subcarpeta oculta para tu app
+
+        if not os.path.exists(app_dir):
+            os.makedirs(app_dir)
+
+        return os.path.join(app_dir, filename)
+
+
 
     def load_accounts(self):
-        """Load saved accounts from keys.json."""
-        path = os.path.join(os.path.dirname(__file__), "keys.json")
+        """Load saved accounts from keys.json en una ruta segura."""
+        path = self.get_config_path()
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({}, f)
+
         try:
             with open(path, "r", encoding="utf-8") as f:
                 self.accounts = json.load(f)
-        except FileNotFoundError:
-            self.accounts = {}
         except Exception:
             self.accounts = {}
+
         names = list(self.accounts.keys())
         self.account_combo["values"] = names
         if names:
             self.account_var.set(names[0])
 
     def save_accounts(self):
-        """Save accounts to keys.json."""
-        path = os.path.join(os.path.dirname(__file__), "keys.json")
+        """Save accounts to keys.json en una ruta segura."""
+        path = self.get_config_path()
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.accounts, f, indent=2)
         except Exception as e:
             messagebox.showerror("Error", f"Failed to save accounts: {e}")
+
+
 
     def add_account_window(self):
         """Open a window to add a new account."""
@@ -428,6 +603,18 @@ class BotUI:
         ttk.Button(top, text="Guardar", command=save).grid(column=0, row=2, columnspan=2, pady=5)
 
 
+    def apply_globals(self):
+        """Apply global parameters to checked signals in the table."""
+        for row_id, sig in self.row_signals.items():
+            if sig.use_global:
+                sig.stop_win = self.stop_win_var.get()
+                sig.stop_loss = self.stop_loss_var.get()
+                sig.martingale = self.martingale_var.get()
+                self.tree.set(row_id, "sw", sig.stop_win)
+                self.tree.set(row_id, "sl", sig.stop_loss)
+                self.tree.set(row_id, "mg", "Yes" if sig.martingale else "No")
+
+
     def start_bot(self):
         token = self.accounts.get(self.account_var.get(), "").strip()
         if not token:
@@ -445,16 +632,21 @@ class BotUI:
             stop_loss=self.stop_loss_var.get(),
             percent=self.percent_var.get(),
         )
+        self.apply_globals()
         for row_id, sig in self.row_signals.items():
-            if sig.use_global:
-                sig.stop_win = self.stop_win_var.get()
-                sig.stop_loss = self.stop_loss_var.get()
-                sig.martingale = self.martingale_var.get()
-                self.tree.set(row_id, "sw", sig.stop_win)
-                self.tree.set(row_id, "sl", sig.stop_loss)
-                self.tree.set(row_id, "mg", "Yes" if sig.martingale else "No")
+            # if sig.use_global:
+            #     sig.stop_win = self.stop_win_var.get()
+            #     sig.stop_loss = self.stop_loss_var.get()
+            #     sig.martingale = self.martingale_var.get()
+            #     self.tree.set(row_id, "sw", sig.stop_win)
+            #     self.tree.set(row_id, "sl", sig.stop_loss)
+            #     self.tree.set(row_id, "mg", "Yes" if sig.martingale else "No")
             self.bot.add_signal(sig)
         self.bot.start()
+
+        self.set_ui_enabled(False)
+        self.stop_button["state"] = "normal"
+
         messagebox.showinfo("Bot", "Bot started")
 
     def load_signals(self):
@@ -524,6 +716,147 @@ class BotUI:
         ttk.Button(top, text="OK", command=save).grid(column=0, row=3, columnspan=2, pady=5)
     def run(self):
         self.root.mainloop()
+
+class ConsoleRedirector:
+    def __init__(self, widget):
+        self.widget = widget
+
+    def write(self, message):
+        self.widget.configure(state="normal")
+        self.widget.insert("end", message)
+        self.widget.see("end")
+        self.widget.configure(state="disabled")
+
+    def flush(self):
+        pass
+
+# class BotUI:
+#     def __init__(self):
+#         self.root = tk.Tk()
+#         self.root.title("Deriv Bot")
+#         self.accounts = {}
+#         self.account_var = tk.StringVar()
+#         self.console_visible = tk.BooleanVar(value=True)
+#         self.row_signals: Dict[str, Signal] = {}
+#         self.bot = None
+
+#         self._build_ui()
+#         self.load_accounts()
+#         self.redirect_output()
+
+#     def _build_ui(self):
+#         self.root.geometry("980x650")
+#         self.root.columnconfigure(0, weight=1)
+#         self.root.rowconfigure(0, weight=1)
+
+#         main = ttk.Frame(self.root, padding=10)
+#         main.grid(sticky="nsew")
+#         main.columnconfigure(1, weight=1)
+
+#         # Left Frame - Configuration
+#         left = ttk.LabelFrame(main, text="Configuración")
+#         left.grid(row=0, column=0, sticky="nw", padx=5, pady=5)
+
+#         ttk.Label(left, text="Cuenta:").grid(row=0, column=0, sticky="w")
+#         self.account_combo = ttk.Combobox(left, textvariable=self.account_var, state="readonly", width=30)
+#         self.account_combo.grid(row=0, column=1, sticky="w")
+#         ttk.Button(left, text="+", width=3, command=self.add_account_window).grid(row=0, column=2, padx=5)
+
+#         ttk.Label(left, text="Delay (s):").grid(row=1, column=0, sticky="w")
+#         self.delay_var = tk.IntVar(value=0)
+#         self.delay_var_entry = ttk.Entry(left, textvariable=self.delay_var, width=10)
+#         self.delay_var_entry.grid(row=1, column=1, sticky="w")
+
+#         ttk.Label(left, text="Stake:").grid(row=2, column=0, sticky="w")
+#         self.stake_var = tk.DoubleVar(value=1.0)
+#         self.stake_var_entry = ttk.Entry(left, textvariable=self.stake_var, width=10)
+#         self.stake_var_entry.grid(row=2, column=1, sticky="w")
+
+#         self.percent_var = tk.BooleanVar(value=False)
+#         self.percent_cb = ttk.Checkbutton(left, text="Stake %", variable=self.percent_var)
+#         self.percent_cb.grid(row=2, column=2, sticky="w")
+
+#         params = ttk.LabelFrame(left, text="Parámetros Globales")
+#         params.grid(row=3, column=0, columnspan=3, sticky="ew", pady=5)
+
+#         self.martingale_var = tk.BooleanVar(value=False)
+#         self.martingale_cb = ttk.Checkbutton(params, text="Martingale", variable=self.martingale_var)
+#         self.martingale_cb.grid(row=0, column=0, sticky="w")
+
+#         ttk.Label(params, text="Stop Win:").grid(row=1, column=0, sticky="w")
+#         self.stop_win_var = tk.DoubleVar(value=0.0)
+#         self.stop_win_entry = ttk.Entry(params, textvariable=self.stop_win_var, width=10)
+#         self.stop_win_entry.grid(row=1, column=1, sticky="w")
+
+#         ttk.Label(params, text="Stop Loss:").grid(row=2, column=0, sticky="w")
+#         self.stop_loss_var = tk.DoubleVar(value=0.0)
+#         self.stop_loss_entry = ttk.Entry(params, textvariable=self.stop_loss_var, width=10)
+#         self.stop_loss_entry.grid(row=2, column=1, sticky="w")
+
+#         self.apply_button = ttk.Button(params, text="Aplicar", command=self.apply_globals)
+#         self.apply_button.grid(row=3, column=0, columnspan=2, pady=5)
+
+#         # Right Frame - Signals, Buttons and Console
+#         right = ttk.Frame(main)
+#         right.grid(row=0, column=1, sticky="nsew")
+#         right.columnconfigure(0, weight=1)
+
+#         ttk.Label(right, text="Señales:").grid(row=0, column=0, sticky="w")
+#         self.signals_text = tk.Text(right, height=4)
+#         self.signals_text.grid(row=1, column=0, sticky="ew")
+
+#         btn_frame = ttk.Frame(right)
+#         btn_frame.grid(row=2, column=0, sticky="ew", pady=5)
+
+#         self.start_button = ttk.Button(btn_frame, text="Start", command=self.start_bot)
+#         self.start_button.pack(side="left", padx=2)
+
+#         self.stop_button = ttk.Button(btn_frame, text="Stop", command=self.stop_bot)
+#         self.stop_button.pack(side="left", padx=2)
+#         self.stop_button["state"] = "disabled"
+
+#         self.load_button = ttk.Button(btn_frame, text="Load", command=self.load_signals)
+#         self.load_button.pack(side="left", padx=2)
+
+#         self.tree = ttk.Treeview(right, columns=("use","fecha", "hora", "symbol", "action", "tf", "sw", "sl", "mg"), show="headings", height=6)
+#         self.tree.grid(row=3, column=0, sticky="nsew", pady=5)
+#         for col in ("use","fecha", "hora", "symbol", "action", "tf", "sw", "sl", "mg"):
+#             self.tree.heading(col, text=col.capitalize())
+#             self.tree.column(col, anchor="center")
+#         self.tree.bind("<Button-1>", self.on_tree_click)
+#         self.tree.bind("<Double-1>", self.edit_signal)
+
+#         ttk.Checkbutton(right, text="Mostrar consola", variable=self.console_visible, command=self.toggle_console).grid(row=4, column=0, sticky="w")
+
+#         self.console_frame = ttk.Frame(right)
+#         self.console_frame.grid(row=5, column=0, sticky="nsew")
+
+#         self.console_output = tk.Text(
+#             self.console_frame, height=8, state="disabled",
+#             bg="#1e1e1e", fg="#d4d4d4", insertbackground="white",
+#             font=("Consolas", 9)
+#         )
+#         self.console_output.pack(fill="both", expand=True)
+
+#     # Resto de métodos: redirect_output, toggle_console, disable_all_inputs,
+#     # enable_all_inputs, set_ui_enabled, stop_bot, load_accounts, save_accounts,
+#     # add_account_window, apply_globals, start_bot, load_signals,
+#     # on_tree_click, edit_signal, run
+
+#     # Puedes seguir aquí pegando tus métodos existentes sin necesidad de cambios lógicos
+
+#     def redirect_output(self):
+#         sys.stdout = ConsoleRedirector(self.console_output)
+#         sys.stderr = ConsoleRedirector(self.console_output)
+
+#     def toggle_console(self):
+#         if self.console_visible.get():
+#             self.console_frame.grid()
+#         else:
+#             self.console_frame.grid_remove()
+
+#     def run(self):
+#         self.root.mainloop()
 
 if __name__ == "__main__":
     if tk is None:
